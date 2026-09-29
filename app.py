@@ -1,6 +1,9 @@
 
 from pathlib import Path
 from urllib.parse import quote_plus
+import os
+import pickle
+import tempfile
 
 import cloudpickle
 import pandas as pd
@@ -12,6 +15,24 @@ BASE_DIR = Path(__file__).resolve().parent
 ENGINE_PATH = BASE_DIR / "recommendation_engine.pkl"
 INVENTORY_PATH = BASE_DIR / "fridge_inventory.pkl"
 FEEDBACK_PATH = BASE_DIR / "feedback_log.pkl"
+
+
+INVENTORY_COLUMNS = [
+    "fridge_id",
+    "ingredient_input",
+    "quantity",
+    "unit",
+    "expiry_date",
+    "date_type",
+    "storage",
+    "inventory_status",
+    "ingredient_normalized",
+    "days_left",
+    "expiry_status",
+    "expiry_priority",
+    "recommendation_available",
+    "ingredient_group",
+]
 
 
 st.set_page_config(
@@ -27,8 +48,66 @@ def load_engine():
         return cloudpickle.load(file)
 
 
+def empty_inventory():
+    """손상된 저장 파일에서도 앱이 시작되도록 빈 냉장고를 생성합니다."""
+    return pd.DataFrame(columns=INVENTORY_COLUMNS)
+
+
+def safe_load_pickle(path, empty_factory, label):
+    """0바이트 또는 불완전한 pickle 파일을 빈 데이터로 복구합니다."""
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            raise EOFError("empty pickle file")
+
+        loaded = pd.read_pickle(path)
+
+        if not isinstance(loaded, pd.DataFrame):
+            raise ValueError("saved object is not a DataFrame")
+
+        return loaded
+
+    except (
+        EOFError,
+        pickle.UnpicklingError,
+        OSError,
+        ValueError,
+        AttributeError,
+    ):
+        st.warning(
+            f"저장된 {label} 파일이 비어 있거나 손상되어 "
+            "빈 상태로 자동 복구했습니다."
+        )
+        return empty_factory()
+
+
+def safe_save_pickle(dataframe, path):
+    """임시 파일에 먼저 쓴 뒤 교체하여 저장 중 파일 손상을 방지합니다."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.stem}_",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+
+        dataframe.to_pickle(temporary_path)
+        os.replace(temporary_path, path)
+
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
 def load_inventory():
-    return pd.read_pickle(INVENTORY_PATH)
+    return safe_load_pickle(
+        INVENTORY_PATH,
+        empty_inventory,
+        "냉장고",
+    )
 
 
 engine = load_engine()
@@ -65,7 +144,7 @@ if "ingredient_group" not in st.session_state.fridge_df.columns:
         "ingredient_group"
     ] = "양념·조미료"
 
-    st.session_state.fridge_df.to_pickle(INVENTORY_PATH)
+    safe_save_pickle(st.session_state.fridge_df, INVENTORY_PATH)
 
 
 
@@ -79,7 +158,7 @@ st.session_state.fridge_df["ingredient_group"] = (
     .replace("", "주재료")
 )
 
-st.session_state.fridge_df.to_pickle(INVENTORY_PATH)
+safe_save_pickle(st.session_state.fridge_df, INVENTORY_PATH)
 
 
 # 피드백 로그 불러오기
@@ -99,14 +178,11 @@ interaction_columns = [
 ]
 
 if "feedback_log_df" not in st.session_state:
-    if FEEDBACK_PATH.exists():
-        st.session_state.feedback_log_df = pd.read_pickle(
-            FEEDBACK_PATH
-        )
-    else:
-        st.session_state.feedback_log_df = pd.DataFrame(
-            columns=interaction_columns
-        )
+    st.session_state.feedback_log_df = safe_load_pickle(
+        FEEDBACK_PATH,
+        lambda: pd.DataFrame(columns=interaction_columns),
+        "사용자 반응",
+    )
 
 st.title("🍳 냉장고를 부탁해")
 st.caption("보유 재료와 소비기한을 고려해 활용하기 좋은 레시피를 추천합니다.")
@@ -148,7 +224,7 @@ fridge_view = fridge_view.rename(
 
 st.dataframe(
     fridge_view,
-    use_container_width=True,
+    width="stretch",
     hide_index=True
 )
 
@@ -165,7 +241,7 @@ if "fridge_id" not in st.session_state.fridge_df.columns:
         1,
         len(st.session_state.fridge_df) + 1
     )
-    st.session_state.fridge_df.to_pickle(INVENTORY_PATH)
+    safe_save_pickle(st.session_state.fridge_df, INVENTORY_PATH)
 
 manage_df = st.session_state.fridge_df
 
@@ -307,7 +383,7 @@ else:
 
             edit_button = st.form_submit_button(
                 "수정 내용 저장",
-                use_container_width=True
+                width="stretch"
             )
 
         if edit_button:
@@ -341,7 +417,7 @@ else:
                 ] = edited_ingredient_group
 
                 st.session_state.fridge_df = updated_df
-                updated_df.to_pickle(INVENTORY_PATH)
+                safe_save_pickle(updated_df, INVENTORY_PATH)
 
                 # 이전 추천 결과 제거
                 st.session_state.pop(
@@ -373,14 +449,14 @@ else:
         if st.button(
             "선택한 재료 삭제",
             type="primary",
-            use_container_width=True
+            width="stretch"
         ):
             updated_df = manage_df[
                 manage_df["fridge_id"] != delete_id
             ].copy()
 
             st.session_state.fridge_df = updated_df
-            updated_df.to_pickle(INVENTORY_PATH)
+            safe_save_pickle(updated_df, INVENTORY_PATH)
 
             st.session_state.pop(
                 "recommendation_result",
@@ -441,7 +517,7 @@ with st.form("add_fridge_item_form"):
 
     add_button = st.form_submit_button(
         "냉장고에 추가",
-        use_container_width=True
+        width="stretch"
     )
 
 if add_button:
@@ -467,7 +543,7 @@ if add_button:
         ] = new_ingredient_group
 
         st.session_state.fridge_df = updated_fridge
-        updated_fridge.to_pickle(INVENTORY_PATH)
+        safe_save_pickle(updated_fridge, INVENTORY_PATH)
 
         st.success(f"'{new_ingredient}'을 냉장고에 추가했습니다.")
         st.rerun()
@@ -631,7 +707,7 @@ with st.expander("⚙️ 세부 조건 설정 · 선택사항"):
 recommend_button = st.button(
     "레시피 5개 추천받기",
     type="primary",
-    use_container_width=True
+    width="stretch"
 )
 
 if recommend_button:
@@ -794,14 +870,14 @@ if "recommendation_result" in st.session_state:
                         st.link_button(
                             "▶️ 유튜브 검색",
                             youtube_url,
-                            use_container_width=True
+                            width="stretch"
                         )
 
                     with naver_column:
                         st.link_button(
                             "🔎 네이버 검색",
                             naver_url,
-                            use_container_width=True
+                            width="stretch"
                         )
 
                     like_column, dislike_column = st.columns(2)
@@ -815,14 +891,14 @@ if "recommendation_result" in st.session_state:
                         like_clicked = st.button(
                             "👍 좋아요",
                             key=f"like_{recipe_id}_{rank}",
-                            use_container_width=True
+                            width="stretch"
                         )
 
                     with dislike_column:
                         dislike_clicked = st.button(
                             "👎 관심 없음",
                             key=f"dislike_{recipe_id}_{rank}",
-                            use_container_width=True
+                            width="stretch"
                         )
 
                     if like_clicked or dislike_clicked:
@@ -846,8 +922,9 @@ if "recommendation_result" in st.session_state:
                             updated_log
                         )
 
-                        updated_log.to_pickle(
-                            FEEDBACK_PATH
+                        safe_save_pickle(
+                            updated_log,
+                            FEEDBACK_PATH,
                         )
 
                         if like_clicked:
