@@ -1,18 +1,19 @@
 
 from pathlib import Path
 from urllib.parse import quote_plus
+import gzip
 import os
 import pickle
 import tempfile
 
-import cloudpickle
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 
 BASE_DIR = Path(__file__).resolve().parent
 
-ENGINE_PATH = BASE_DIR / "recommendation_engine.pkl"
+DATA_PATH = BASE_DIR / "recommendation_data.pkl.gz"
 INVENTORY_PATH = BASE_DIR / "fridge_inventory.pkl"
 FEEDBACK_PATH = BASE_DIR / "feedback_log.pkl"
 
@@ -43,9 +44,10 @@ st.set_page_config(
 
 
 @st.cache_resource
-def load_engine():
-    with open(ENGINE_PATH, "rb") as file:
-        return cloudpickle.load(file)
+def load_recommendation_data():
+    """함수 객체가 없는 안전한 추천 데이터만 불러옵니다."""
+    with gzip.open(DATA_PATH, "rb") as file:
+        return pickle.load(file)
 
 
 def empty_inventory():
@@ -110,7 +112,368 @@ def load_inventory():
     )
 
 
-engine = load_engine()
+recommendation_data = load_recommendation_data()
+recipes_df = recommendation_data["recipes"]
+tfidf_matrix = recommendation_data["tfidf_matrix"]
+tfidf_vocabulary = recommendation_data["vocabulary"]
+tfidf_idf = recommendation_data["idf"]
+ingredient_map = recommendation_data["ingredient_map"]
+basic_seasonings = set(recommendation_data["basic_seasonings"])
+
+
+def normalize_ingredient(name):
+    value = str(name).strip()
+    if not value:
+        return ""
+
+    if value in ingredient_map:
+        return ingredient_map[value]
+
+    compact_value = value.replace(" ", "")
+    return ingredient_map.get(compact_value, value)
+
+
+def refresh_fridge_status(inventory_df):
+    result = inventory_df.copy()
+
+    for column in INVENTORY_COLUMNS:
+        if column not in result.columns:
+            result[column] = pd.NA
+
+    if result.empty:
+        return result[INVENTORY_COLUMNS]
+
+    result["expiry_date"] = pd.to_datetime(
+        result["expiry_date"],
+        errors="coerce",
+    )
+    today = pd.Timestamp.today().normalize()
+    result["days_left"] = (
+        result["expiry_date"].dt.normalize() - today
+    ).dt.days.astype("Int64")
+
+    def expiry_status(days_left):
+        if pd.isna(days_left):
+            return "미입력"
+        if days_left < 0:
+            return "기한 지남"
+        if days_left <= 2:
+            return "임박"
+        if days_left <= 7:
+            return "곧 임박"
+        return "여유"
+
+    def expiry_priority(days_left):
+        if pd.isna(days_left) or days_left < 0:
+            return 0.0
+        if days_left <= 2:
+            return 1.0
+        if days_left <= 7:
+            return 0.5
+        return 0.0
+
+    result["expiry_status"] = result["days_left"].apply(
+        expiry_status
+    )
+    result["expiry_priority"] = result["days_left"].apply(
+        expiry_priority
+    )
+    result["ingredient_normalized"] = result[
+        "ingredient_input"
+    ].apply(normalize_ingredient)
+    result["inventory_status"] = result[
+        "inventory_status"
+    ].fillna("보관중")
+    result["recommendation_available"] = (
+        result["inventory_status"].eq("보관중")
+        & result["days_left"].fillna(0).ge(0)
+    )
+
+    return result[INVENTORY_COLUMNS]
+
+
+def add_fridge_item(
+    inventory_df,
+    ingredient,
+    quantity,
+    unit,
+    expiry_date=None,
+    date_type="소비기한",
+    storage="냉장",
+):
+    if not str(ingredient).strip():
+        raise ValueError("재료명을 입력해주세요.")
+
+    current = refresh_fridge_status(inventory_df)
+    existing_ids = pd.to_numeric(
+        current["fridge_id"],
+        errors="coerce",
+    ).dropna()
+    new_id = int(existing_ids.max()) + 1 if not existing_ids.empty else 1
+
+    new_item = pd.DataFrame(
+        [{
+            "fridge_id": new_id,
+            "ingredient_input": str(ingredient).strip(),
+            "quantity": float(quantity),
+            "unit": unit,
+            "expiry_date": pd.to_datetime(expiry_date),
+            "date_type": date_type,
+            "storage": storage,
+            "inventory_status": "보관중",
+            "ingredient_normalized": normalize_ingredient(ingredient),
+            "days_left": pd.NA,
+            "expiry_status": pd.NA,
+            "expiry_priority": 0.0,
+            "recommendation_available": True,
+            "ingredient_group": "주재료",
+        }]
+    )
+
+    return refresh_fridge_status(
+        pd.concat([current, new_item], ignore_index=True)
+    )
+
+
+def make_query_vector(ingredients):
+    vector = np.zeros(len(tfidf_vocabulary), dtype=np.float32)
+
+    for ingredient in ingredients:
+        feature_index = tfidf_vocabulary.get(ingredient)
+        if feature_index is not None:
+            vector[feature_index] += 1.0
+
+    vector *= tfidf_idf
+    norm = np.linalg.norm(vector)
+    if norm > 0:
+        vector /= norm
+    return vector
+
+
+def build_recommendation_reason(
+    row,
+    max_kcal=None,
+    max_sodium=None,
+    min_protein=None,
+    cooking_method=None,
+    category=None,
+):
+    reasons = []
+    expiring = row.get("expiring_ingredients", [])
+    matched = row.get("matched_ingredients", [])
+    missing_count = int(row.get("missing_count", 0))
+
+    if expiring:
+        reasons.append(
+            "소비기한이 임박한 재료를 활용할 수 있어요: "
+            + ", ".join(expiring)
+            + "."
+        )
+
+    if missing_count == 0:
+        reasons.append("주요 재료를 모두 보유하고 있어 바로 만들기 좋아요.")
+    else:
+        reasons.append(
+            f"보유 재료 {len(matched)}개를 활용할 수 있고 "
+            f"추가 재료 {missing_count}개가 필요해요."
+        )
+
+    nutrition_conditions = []
+    if max_kcal is not None:
+        nutrition_conditions.append(f"{max_kcal}kcal 이하")
+    if max_sodium is not None:
+        nutrition_conditions.append(f"나트륨 {max_sodium}mg 이하")
+    if min_protein is not None:
+        nutrition_conditions.append(f"단백질 {min_protein}g 이상")
+    if nutrition_conditions:
+        reasons.append(
+            "선택한 영양 조건을 만족해요: "
+            + ", ".join(nutrition_conditions)
+            + "."
+        )
+    if category is not None:
+        reasons.append(f"선택한 음식 종류인 '{category}'에 해당해요.")
+    if cooking_method is not None:
+        reasons.append(f"선택한 조리 방법인 '{cooking_method}'에 해당해요.")
+
+    return " ".join(reasons)
+
+
+def recommend_final(
+    inventory_df,
+    excluded_ingredients=None,
+    top_n=5,
+    max_missing=5,
+    max_kcal=None,
+    max_sodium=None,
+    min_protein=None,
+    cooking_method=None,
+    category=None,
+    expiry_weight=0.15,
+):
+    inventory = refresh_fridge_status(inventory_df)
+    available = inventory[
+        inventory["recommendation_available"].fillna(False)
+    ].copy()
+
+    user_ingredients = list(dict.fromkeys(
+        available["ingredient_normalized"]
+        .dropna()
+        .astype(str)
+        .tolist()
+    ))
+    if not user_ingredients:
+        raise ValueError("추천에 사용할 수 있는 냉장고 재료가 없습니다.")
+
+    candidates = recipes_df.copy()
+    if category is not None:
+        candidates = candidates[candidates["RCP_PAT2"].eq(category)]
+    if cooking_method is not None:
+        candidates = candidates[candidates["RCP_WAY2"].eq(cooking_method)]
+    if max_kcal is not None:
+        candidates = candidates[
+            pd.to_numeric(candidates["INFO_ENG_CLEAN"], errors="coerce")
+            .le(max_kcal)
+        ]
+    if max_sodium is not None:
+        candidates = candidates[
+            pd.to_numeric(candidates["INFO_NA_CLEAN"], errors="coerce")
+            .le(max_sodium)
+        ]
+    if min_protein is not None:
+        candidates = candidates[
+            pd.to_numeric(candidates["INFO_PRO_CLEAN"], errors="coerce")
+            .ge(min_protein)
+        ]
+
+    excluded = {
+        normalize_ingredient(value)
+        for value in (excluded_ingredients or [])
+        if str(value).strip()
+    }
+    user_set = set(user_ingredients)
+    expiry_map = dict(zip(
+        available["ingredient_normalized"].astype(str),
+        pd.to_numeric(available["expiry_priority"], errors="coerce")
+        .fillna(0.0),
+    ))
+
+    query_vector = make_query_vector(user_ingredients)
+    similarity = tfidf_matrix @ query_vector
+    rows = []
+
+    for index, recipe in candidates.iterrows():
+        recipe_ingredients = recipe.get("ingredients_normalized", [])
+        if not isinstance(recipe_ingredients, list):
+            recipe_ingredients = []
+
+        recipe_ingredients = list(dict.fromkeys(
+            str(value) for value in recipe_ingredients if str(value).strip()
+        ))
+        recipe_set = set(recipe_ingredients)
+
+        if excluded and recipe_set.intersection(excluded):
+            continue
+
+        matched = [value for value in recipe_ingredients if value in user_set]
+        missing = [
+            value for value in recipe_ingredients
+            if value not in user_set and value not in basic_seasonings
+        ]
+        if not matched or len(missing) > max_missing:
+            continue
+
+        denominator = len(matched) + len(missing)
+        match_percent = (
+            len(matched) / denominator * 100 if denominator else 0.0
+        )
+        rule_score = min(100.0, match_percent + len(matched) * 2.5)
+        tfidf_score = float(similarity[index]) * 100.0
+        hybrid_score = rule_score * 0.7 + tfidf_score * 0.3
+
+        expiring = [
+            value for value in matched if expiry_map.get(value, 0.0) > 0
+        ]
+        expiry_score = (
+            float(np.mean([expiry_map[value] for value in expiring])) * 100
+            if expiring else 0.0
+        )
+        final_score = (
+            hybrid_score * (1 - expiry_weight)
+            + expiry_score * expiry_weight
+        )
+
+        output = recipe.to_dict()
+        output.update({
+            "matched_ingredients": matched,
+            "missing_ingredients": missing,
+            "missing_count": len(missing),
+            "match_percent": round(match_percent, 1),
+            "rule_score": round(rule_score, 1),
+            "tfidf_score": round(tfidf_score, 1),
+            "hybrid_score": round(hybrid_score, 1),
+            "expiring_ingredients": expiring,
+            "expiry_score": round(expiry_score, 1),
+            "final_score": round(final_score, 1),
+        })
+        output["recommendation_reason"] = build_recommendation_reason(
+            output,
+            max_kcal=max_kcal,
+            max_sodium=max_sodium,
+            min_protein=min_protein,
+            cooking_method=cooking_method,
+            category=category,
+        )
+        rows.append(output)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(
+            ["final_score", "missing_count"],
+            ascending=[False, True],
+        )
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+
+
+def log_recipe_action(
+    log_df,
+    recipe,
+    action,
+    inventory_df,
+    recommended_rank,
+):
+    current = log_df.copy()
+    event_ids = pd.to_numeric(
+        current.get("event_id", pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+    event_id = int(event_ids.max()) + 1 if not event_ids.empty else 1
+    preference_label = 1 if action == "좋아요" else 0
+
+    new_log = pd.DataFrame([{
+        "event_id": event_id,
+        "event_time": pd.Timestamp.now(),
+        "RCP_SEQ": recipe.get("RCP_SEQ"),
+        "RCP_NM": recipe.get("RCP_NM"),
+        "action": action,
+        "preference_label": preference_label,
+        "recommended_rank": recommended_rank,
+        "matched_ingredients": recipe.get("matched_ingredients", []),
+        "available_ingredients": inventory_df.get(
+            "ingredient_normalized",
+            pd.Series(dtype=str),
+        ).dropna().astype(str).tolist(),
+        "hybrid_score": recipe.get("hybrid_score"),
+        "expiry_score": recipe.get("expiry_score"),
+        "final_score": recipe.get("final_score"),
+    }])
+
+    return pd.concat([current, new_log], ignore_index=True)
 
 if "fridge_df" not in st.session_state:
     st.session_state.fridge_df = load_inventory()
@@ -396,7 +759,7 @@ else:
                     manage_df["fridge_id"] != edit_id
                 ].copy()
 
-                updated_df = engine["add_fridge_item"](
+                updated_df = add_fridge_item(
                     inventory_df=remaining_df,
                     ingredient=edited_ingredient.strip(),
                     quantity=edited_quantity,
@@ -524,7 +887,7 @@ if add_button:
     if not new_ingredient.strip():
         st.warning("재료명을 입력해주세요.")
     else:
-        updated_fridge = engine["add_fridge_item"](
+        updated_fridge = add_fridge_item(
             inventory_df=st.session_state.fridge_df,
             ingredient=new_ingredient.strip(),
             quantity=new_quantity,
@@ -730,7 +1093,7 @@ if recommend_button:
     )
 
     try:
-        recommendation_result = engine["recommend_final"](
+        recommendation_result = recommend_final(
             inventory_df=st.session_state.fridge_df,
             excluded_ingredients=excluded_ingredients,
             top_n=5,
@@ -908,9 +1271,7 @@ if "recommendation_result" in st.session_state:
                             else "싫어요"
                         )
 
-                        updated_log = engine[
-                            "log_recipe_action"
-                        ](
+                        updated_log = log_recipe_action(
                             log_df=st.session_state.feedback_log_df,
                             recipe=recipe,
                             action=selected_action,
